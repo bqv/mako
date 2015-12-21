@@ -1,0 +1,2 @@
+# mako
+Haskell IRC bot
