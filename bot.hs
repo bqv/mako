@@ -1,64 +1,137 @@
-import Text.Printf (hPrintf, printf)
 import Network (connectTo, PortID(PortNumber))
 import Debug.Trace (trace, traceShow, traceShowId)
 
+import Text.Read (readMaybe)
+import Text.Printf (hPrintf, printf)
+
+import Control.DeepSeq (force)
 import Control.Applicative ()
 import Control.Lens.Tuple (_1)
 import Control.Lens ((&), (%~), over)
+import Control.Monad.Morph (hoist, generalize)
+import Control.Monad (foldM, ap, filterM, liftM, mapM)
+import Control.Monad.State.Strict (StateT, State, get, put, modify, gets,
+                            state, liftIO, lift, evalStateT, evalState)
 
 import System.Random (randomR, newStdGen, StdGen, Random)
-import System.IO (Handle, hSetBuffering, hGetLine, BufferMode(..))
+import System.Directory (getDirectoryContents, doesFileExist)
+import System.IO (Handle, hSetBuffering, hGetLine, BufferMode(..), IOMode(..),
+                  mkTextEncoding, openFile, hSetEncoding, hGetContents)
 
 import Data.Char (toLower)
 import Data.Maybe (catMaybes)
+import Data.Functor.Identity (Identity, runIdentity)
 import Data.List (isPrefixOf, elem, intersperse, sort, group, delete)
 import Data.Map (Map, empty, member, findWithDefault, fromList, (!), 
                  unions, mapKeys, keys, insertWith, unionWith, toList,
-                 mapWithKey, fromListWith, fold)
+                 mapWithKey, fromListWith, fold, elemAt, size)
 
 server          = "irc.sublumin.al"
 port            = 6667
 autojoinChan    = ["#spam"]
 nick            = "mako"
 markovOrder     = 2
-opList          = unions (map (\f -> mapKeys f (fromList [("imitate", imitate), ("im", imitate)])) (map (:) "'"))
+opList          = unions (map (\f ->
+                                    mapKeys f . fromList $
+                                                  [("imitate", imitate),
+                                                   ("im", imitate),
+                                                   ("speak", imitateall),
+                                                   ("imitateall", imitateall)])
+                              (map (:) ".!@"))
+
+data Index keyType = All | Name keyType deriving (Eq)
+
+instance Ord a => Ord (Index a) where
+    All <= All = True
+    All <= Name a = True
+    Name a <= Name b = a <= b
+    _ <= _ = False
 
 type FrequencyMap wordType = Map (Maybe wordType) Integer
 
 type MarkovChain wordType = Map [Maybe wordType] (FrequencyMap wordType)
 
-type ChainList keyType wordType = Map keyType (MarkovChain wordType)
+type ChainList keyType wordType = Map (Index keyType) (MarkovChain wordType)
 
-data State = State (ChainList String String) StdGen
 
-main    = do
-    h <- connectTo server (PortNumber (fromIntegral port))
-    hSetBuffering h NoBuffering
-    write h "NICK" nick
-    write h "USER" "markovbot 0 * :Markov bot"
-    rng <- newStdGen
-    listen h (State empty rng)
+type Rand = State StdGen
+type RandT = StateT StdGen
+
+type Markov = State (ChainList String String)
+type MarkovT = StateT (ChainList String String)
+
+main :: IO ()
+main    = newStdGen >>= \gen ->
+              evalStateT (evalStateT (lift loadLogs >> connect) gen) empty
+
+connect :: RandT (MarkovT IO) ()
+connect = liftIO ( (connectTo server . PortNumber . fromIntegral $ port) >>=
+          \h -> trace "Connecting..."
+            hSetBuffering h NoBuffering >>
+            write h "USER" "markovbot 0 * :Markov bot" >>
+            write h "NICK" nick >>
+            return h ) >>=
+          listen
+
+loadLogs :: MarkovT IO [[()]]
+loadLogs    = let
+                folders = [ "/srv/log/subluminal/#programming/" ]
+              in
+                liftIO (
+                    (fmap concat . sequence . map getDir $ folders) >>=
+                    filterM doesFileExist ) >>= trace "Loading done."
+                mapM importLog
+            where
+                getDir :: FilePath -> IO [FilePath]
+                getDir p = fmap (fmap (++) [p] `ap`)
+                                $ getDirectoryContents p
+
+importLog :: FilePath -> MarkovT IO [()]
+importLog path  = liftIO (
+                    printf "Loading %s...\n" path >>
+                    readUTF8File path >>=
+                    return . map processLogLine . lines ) >>=
+                  \logs ->
+                        hoist generalize ((mapM . uncurry $ catalog) logs)
+
+processLogLine :: String -> (String, [String])
+processLogLine line = let
+                        entry = takeSplit 2 ' ' line
+                        nick = stripNick (entry !! 1)
+                        msg = splitBy ' ' (entry !! 2)
+                      in
+                        (nick, msg)
+            where
+                stripNick :: String -> String
+                stripNick = dropWhile (flip elem "<0123456789")
+                     . filter (not . flip elem "\ETX>")
+
+readUTF8File :: FilePath -> IO String
+readUTF8File path = openFile path ReadMode >>= \fd ->
+                        mkTextEncoding "UTF-8//IGNORE" >>=
+                        hSetEncoding fd >>
+                        hGetContents fd 
 
 write :: Handle -> String -> String -> IO ()
-write h s t     = do
-    hPrintf h "%s %s\r\n" s t
-    printf     "=>> %s %s\n" s t
+write h s t     = hPrintf h "%s %s\r\n" s t >>
+                  printf "=>> %s %s\n" s t
 
-listen :: Handle -> State -> IO State
-listen h state = do
-    t <- hGetLine h
-    let s = init t
-    putStrLn s
-    state <- if isPing s then doPong s else parseLine h state (splitBy ' ' s)
-    listen h state
+listen :: Handle -> RandT (MarkovT IO) ()
+listen h    = liftIO (hGetLine h) >>=
+              \t -> let
+                      s = init t
+                    in
+                      liftIO (putStrLn s) >>
+                      if isPing s then
+                          liftIO (doPong s) >> listen h
+                      else
+                          parseLine h (splitBy ' ' s) >> listen h
   where
     isPing x    = "PING :" `isPrefixOf` x
-    doPong x    = write h "PONG" (':' : drop 6 x) >> return state
+    doPong x    = write h "PONG" (':' : drop 6 x)
 
 joinChan :: Handle -> [String] -> IO ()
-joinChan h (x:xs)   = do
-    write h "JOIN" x
-    joinChan h xs
+joinChan h (x:xs)   = write h "JOIN" x >> joinChan h xs
 joinChan _ []       = return ()
 
 privmsg :: Handle -> String -> String -> IO ()
@@ -67,42 +140,47 @@ privmsg h c s = write h "PRIVMSG" (c ++ " :" ++ s)
 notice :: Handle -> String -> String -> IO ()
 notice h c s = write h "NOTICE" (c ++ " :" ++ s)
 
-parseLine :: Handle -> State -> [String] -> IO State
-parseLine h state (prefix:command:params)
-        | command == "001"              = do
-                write h "UMODE2" "+B"
-                joinChan h autojoinChan
-                return state
-        | command == "INVITE"           = joinChan h (tail params) >> return state
-        | command == "PRIVMSG"          = handleMsg h state prefix params
-        | otherwise                     = return state -- Ignore
-parseLine _ state _                     = putStrLn "Couldn't parse line" >> return state
+parseLine :: Handle -> [String] -> RandT (MarkovT IO) ()
+parseLine h (prefix:command:params)
+        | command == "001"      = liftIO ( write h "UMODE2" "+B" >>
+                                           joinChan h autojoinChan )
+        | command == "INVITE"   = liftIO ( joinChan h (tail params) )
+        | command == "PRIVMSG"  = handleMsg h prefix params
+        | otherwise             = return () -- Ignore
+parseLine _ _                   = liftIO ( putStrLn "Couldn't parse line" )
 
-handleMsg :: Handle -> State -> String -> [String] -> IO State
-handleMsg h state prefix (chan:(_:operation):args)
-        | member op opList  = do
-            putStrLn $ senderNick ++" called "++ op++(foldl (++) "('" (intersperse "','" args))++"')"++" in "++ chan
-            let (newState, resp) = (opList ! op) state args
-            notice h chan resp
-            return newState
-        | otherwise         = do
-            putStrLn (senderNick ++" said "++ (foldl (++) "" (intersperse " " (operation:args)))++" in "++ chan)
-            return $ catalog state senderNick (operation:args)
+handleMsg :: Handle -> String -> [String] -> RandT (MarkovT IO) ()
+handleMsg h prefix (chan:(_:operation):args)
+        | member op opList  = liftIO ( printf "%s called %s in %s\n"
+                                     senderNick
+                                     (op ++ foldl (++) "('" (intersperse "','" args) ++ "')")
+                                     chan ) >>
+                              hoist (hoist generalize) ((opList ! op) args) >>=
+                              liftIO . ( notice h chan )
+        | otherwise         = liftIO ( printf "%s said %s in %s\n"
+                                       senderNick
+                                       (foldl (++) "" . intersperse " " $ operation:args)
+                                       chan ) >>
+                              lift ( hoist generalize $ catalog senderNick (operation:args) )
         where
             op          = map toLower operation
             senderNick  = takeWhile (\c -> (c /='@') && (c /='!')) $ tail prefix
-handleMsg _ state _ _                             = putStrLn "Couldn't handle message" >> return state
+handleMsg _ _ _             = liftIO ( putStrLn "Couldn't handle message" )
 
 -- Pure
 
-catalog :: State -> String -> [String] -> State
-catalog state user []               = state
-catalog (State chains g) user words = let
-                                        newChain = fromWalk strip words
-                                      in State (insertWith markovAdd user newChain chains) g
-                            where
-                                strip :: String -> String
-                                strip s = dropWhile (flip elem "<0123456789") $ filter (not . flip elem "\ETX>") s
+catalog :: String -> [String] -> Markov ()
+catalog user []      = return ()
+catalog user words   = let
+                         chainDiff = fromWalk stripMsg words
+                         key = Name user
+                         updateChain = insertWith markovAdd key chainDiff
+                         updateAll = insertWith markovAdd All chainDiff
+                       in
+                         modify (updateChain . updateAll)
+                   where
+                       stripMsg :: String -> String
+                       stripMsg s = s
 
 markovAdd :: (Ord word) => MarkovChain word -> MarkovChain word -> MarkovChain word
 markovAdd large small   = unionWith freqAdd large small
@@ -136,44 +214,73 @@ toTransitions strip l   = helper $ (replicate (markovOrder) Nothing) ++ map (Jus
 --      Empty list -> Return Nothing ✔
 --      Otherwise  -> Select from list keys where max intersection 
 
-imitate :: State -> [String] -> (State, String)
-imitate state []                        = (state, colour 4 "...must construct additional pylons...")
-imitate state@(State chains rng) (user:seeds)
-                | targetChain == empty  = (state, "-")
-                | otherwise = let
-                                (markovWalk, newGen) = trace ("Trying imitate with chain: "++(show targetChain))
-                                                        $ startWalk targetChain 40 seeds rng
-                                imitation = foldl (++) "" $ intersperse " " (catMaybes markovWalk)
-                              in (State chains newGen, "<"++user++"> "++(colour 10 imitation))
-                where
-                    targetChain = findWithDefault empty user chains
+imitateall :: [String] -> RandT Markov String
+imitateall seeds    = lift get >>= (\chains ->
+                        hoist generalize . runImitate seeds $
+                            findWithDefault empty All chains ) >>=
+                      return . (\s -> colour 14 s)
 
-startWalk :: (Ord word, Show word) => MarkovChain word -> Int -> [word] -> StdGen -> ([Maybe word], StdGen)
-startWalk chain _ _ _ | chain == empty  = error "(startWalk) This shouldn't happen"
-startWalk chain n [] rng                = let 
-                                            (firstStep, newGen) = choose (keys chain) rng
-                                          in over _1 (firstStep++) $ walk chain n firstStep newGen
-startWalk chain n seeds rng             = let
-                                            keyList = keys chain
-                                            candidates = findMaxSetIntersectionList (map Just seeds) keyList
-                                            (seedStep, newGen) = choose candidates rng
-                                          in over _1 (seedStep++) $ walk chain n seedStep newGen
+imitate :: [String] -> RandT Markov String
+imitate []  = return $ colour 4 "...must construct additional pylons..."
+imitate (user:seeds)    = lift get >>= (\chains ->
+                            hoist generalize . runImitate seeds $
+                                case (readMaybe user :: Maybe Int) of
+                                    Nothing ->
+                                        let
+                                          key = Name user
+                                        in
+                                          findWithDefault empty key chains
+                                    Just i  ->
+                                      if i >= 0 && i < size chains then
+                                        snd $ elemAt i chains
+                                      else
+                                        let
+                                          key = Name user
+                                        in
+                                          findWithDefault empty key chains) >>=
+                          return . (\s -> "<"++user++"> "++(colour 10 s))
 
-walk :: (Ord word, Show word) => MarkovChain word -> Int -> [Maybe word] -> StdGen -> ([Maybe word], StdGen)
-walk chain i last rng
-        | i > 0     = let
-                        (next, newGen) = step chain last rng
-                        (rest, finalGen) = walk chain (i-1) (tail last ++ [next]) newGen
-                      in trace ("Step from "++(show last)++" to "++(show next)) $
+runImitate :: [String] -> MarkovChain String -> Rand String
+runImitate seeds chain
+        | chain == empty    = return "-"
+        | otherwise         = startWalk chain 40 seeds >>=
+                              return . joinMaybes
+        where
+            joinMaybes :: [Maybe String] -> String
+            joinMaybes = foldl (++) "" . intersperse " " . catMaybes
+
+startWalk :: (Ord word, Show word) => MarkovChain word -> Int -> [word] -> Rand [Maybe word]
+startWalk chain _ _
+        | chain == empty    = error "(startWalk) This shouldn't happen"
+startWalk chain n []        = choose (keys chain) >>= \step ->
+                                walk chain n step >>=
+                                return . (++) step
+startWalk chain n seeds     = let
+                                keyList = keys chain
+                                candidates = findMaxSetIntersectionList
+                                                    (map Just seeds)
+                                                    keyList
+                              in
+                                choose candidates >>= \step ->
+                                    walk chain n step >>=
+                                    return . (++) step
+
+walk :: (Ord word, Show word) => MarkovChain word -> Int -> [Maybe word] -> Rand [Maybe word]
+walk chain i last
+        | i > 0     = step chain last >>= \next ->
+                          trace ("Step from "++(show last)++" to "++(show next)) $
                           if next == Nothing then
-                            ([Nothing], newGen)
+                            return [Nothing]
                           else
-                            (next : rest, finalGen)
-        | i == 0    = (last, rng)
+                            walk chain (i-1) (tail last ++ [next]) >>= 
+                            return . (next :)
+        | i == 0    = return last
 
-step :: (Ord word) => MarkovChain word -> [Maybe word] -> StdGen -> (Maybe word, StdGen)
-step chain current rng = let freqMap = findWithDefault (fromList [(Nothing, 1)]) current chain
-                         in sample freqMap rng 
+step :: (Ord word) => MarkovChain word -> [Maybe word] -> Rand (Maybe word)
+step chain current = let
+                        freqMap = findWithDefault (fromList [(Nothing, 1)]) current chain
+                     in
+                        sample freqMap 
 
 findMaxSetIntersectionList :: (Eq a) => [a] -> [[a]] -> [[a]]
 findMaxSetIntersectionList [] setList = setList
@@ -191,20 +298,19 @@ findMaxSetIntersectionList stableSet setList =
                          else
                             setList -- error "(findMaxSetIntersectionList) This shouldn't happen"
 
-sample :: FrequencyMap word -> StdGen -> (Maybe word, StdGen)
-sample choiceMap rng        = (search (toList choiceMap) randNum, newGen)
+sample :: FrequencyMap word -> Rand (Maybe word)
+sample choiceMap    = (state . randomR) (0, total-1) >>=
+                      return . search (toList choiceMap)
         where
             total = fold (+) 0 choiceMap
-            (randNum, newGen) = randomR (0, total-1) rng
             search mapList val = case mapList of
                             ((a,b):xs)  -> if val >= b then search xs (val - b) else a
                             []          -> error "(sample) This shouldn't happen"
 
-choose :: [a] -> StdGen -> (a, StdGen)
-choose [] rng               = error "(choose) This shouldn't happen"
-choose choices rng          = (choices !! index, newGen)
-        where
-            (index, newGen) = randomR (0, length choices - 1) rng
+choose :: [a] -> Rand a
+choose []       = error "(choose) This shouldn't happen"
+choose choices  = (state . randomR) (0, length choices - 1) >>=
+                  return . (choices !!)
 
 -- Util
 
@@ -221,4 +327,14 @@ splitBy del str = helper del str []
     helper del (x:xs) acc   
         | x == del  = acc : helper del xs []  
         | otherwise = let acc0 = acc ++ [x] in helper del xs acc0 
+
+takeSplit :: Eq a => Int -> a -> [a] -> [[a]]
+takeSplit num del str = helper num del str []   
+  where 
+    helper :: Eq a => Int -> a -> [a] -> [a] -> [[a]]
+    helper n _ [] acc = [acc] 
+    helper n del (x:xs) acc   
+        | n == 0    = [x:xs]
+        | x == del  = acc : helper (n - 1) del xs []
+        | otherwise = let acc0 = acc ++ [x] in helper n del xs acc0 
 
