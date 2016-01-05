@@ -4,7 +4,6 @@ import Debug.Trace (trace, traceShow, traceShowId)
 import Text.Read (readMaybe)
 import Text.Printf (hPrintf, printf)
 
-import Control.DeepSeq (force)
 import Control.Applicative ()
 import Control.Lens.Tuple (_1)
 import Control.Lens ((&), (%~), over)
@@ -16,12 +15,23 @@ import Control.Monad.State.Strict (StateT, State, get, put, modify, gets,
 import System.Random (randomR, newStdGen, StdGen, Random)
 import System.Directory (getDirectoryContents, doesFileExist)
 import System.IO (Handle, hSetBuffering, hGetLine, BufferMode(..), IOMode(..),
-                  mkTextEncoding, openFile, hSetEncoding, hGetContents)
+                  mkTextEncoding, withFile, hSetEncoding)
 
-import Data.Char (toLower)
+import Data.Char (toLower, chr)
+import Data.Monoid (mappend, mconcat)
 import Data.Maybe (catMaybes)
+import Data.Text.Encoding (decodeUtf8With)
+import Data.Text.Encoding.Error (lenientDecode)
 import Data.Functor.Identity (Identity, runIdentity)
-import Data.List (isPrefixOf, elem, intersperse, sort, group, delete)
+import Data.List (isPrefixOf, elem, intersperse, sort, group, intercalate)
+import Data.ByteString.Builder (Builder, intDec, int8, char8, string8,
+                                byteString, toLazyByteString)
+import qualified Data.ByteString.Char8 as B
+                             (ByteString, singleton, pack, unpack,
+                              hGetContents, hPutStr, hPutStrLn, hGetLine,
+                              lines, words, unwords, intercalate, concat,
+                              dropWhile, filter, cons, append, drop, take,
+                              init, tail, split, length, isPrefixOf)
 import Data.Map (Map, empty, member, findWithDefault, fromList, (!), 
                  unions, mapKeys, keys, insertWith, unionWith, toList,
                  mapWithKey, fromListWith, fold, elemAt, size)
@@ -38,6 +48,8 @@ opList          = unions (map (\f ->
                                                    ("speak", imitateall),
                                                    ("imitateall", imitateall)])
                               (map (:) ".!@"))
+
+type ByteString = B.ByteString
 
 data Index keyType = All | Name keyType deriving (Eq)
 
@@ -57,8 +69,8 @@ type ChainList keyType wordType = Map (Index keyType) (MarkovChain wordType)
 type Rand = State StdGen
 type RandT = StateT StdGen
 
-type Markov = State (ChainList String String)
-type MarkovT = StateT (ChainList String String)
+type Markov = State (ChainList ByteString ByteString)
+type MarkovT = StateT (ChainList ByteString ByteString)
 
 main :: IO ()
 main    = newStdGen >>= \gen ->
@@ -66,7 +78,9 @@ main    = newStdGen >>= \gen ->
 
 connect :: RandT (MarkovT IO) ()
 connect = liftIO ( (connectTo server . PortNumber . fromIntegral $ port) >>=
-          \h -> trace "Connecting..."
+          \h ->
+            mkTextEncoding "UTF-8//IGNORE" >>=
+            hSetEncoding h >>
             hSetBuffering h NoBuffering >>
             write h "USER" "markovbot 0 * :Markov bot" >>
             write h "NICK" nick >>
@@ -79,7 +93,7 @@ loadLogs    = let
               in
                 liftIO (
                     (fmap concat . sequence . map getDir $ folders) >>=
-                    filterM doesFileExist ) >>= trace "Loading done."
+                    filterM doesFileExist ) >>= 
                 mapM importLog
             where
                 getDir :: FilePath -> IO [FilePath]
@@ -89,28 +103,29 @@ loadLogs    = let
 importLog :: FilePath -> MarkovT IO [()]
 importLog path  = liftIO (
                     printf "Loading %s...\n" path >>
-                    readUTF8File path >>=
-                    return . map processLogLine . lines ) >>=
+                    withFile path ReadMode B.hGetContents >>=
+                    return . map processLogLine . B.lines ) >>=
                   \logs ->
-                        hoist generalize ((mapM . uncurry $ catalog) logs)
+                        hoist generalize ((mapM . uncurry $! catalog) logs)
 
-processLogLine :: String -> (String, [String])
+processLogLine :: ByteString -> (ByteString, [ByteString])
 processLogLine line = let
-                        entry = takeSplit 2 ' ' line
-                        nick = stripNick (entry !! 1)
-                        msg = splitBy ' ' (entry !! 2)
+                        entry = tail . B.words $ line
+                        nick = stripNick . head $ entry
+                        msg = tail $ entry
                       in
                         (nick, msg)
             where
-                stripNick :: String -> String
-                stripNick = dropWhile (flip elem "<0123456789")
-                     . filter (not . flip elem "\ETX>")
+                stripNick :: ByteString -> ByteString
+                stripNick s = B.drop 1 $ B.take (B.length s - 1) s
+                --stripNick = B.dropWhile (flip elem "<0123456789")
+                --     . B.filter (not . flip elem "\ETX>")
 
-readUTF8File :: FilePath -> IO String
-readUTF8File path = openFile path ReadMode >>= \fd ->
+readUTF8File :: FilePath -> IO ByteString
+readUTF8File path = withFile path ReadMode (\fd ->
                         mkTextEncoding "UTF-8//IGNORE" >>=
                         hSetEncoding fd >>
-                        hGetContents fd 
+                        B.hGetContents fd )
 
 write :: Handle -> String -> String -> IO ()
 write h s t     = hPrintf h "%s %s\r\n" s t >>
@@ -125,20 +140,20 @@ listen h    = liftIO (hGetLine h) >>=
                       if isPing s then
                           liftIO (doPong s) >> listen h
                       else
-                          parseLine h (splitBy ' ' s) >> listen h
-  where
-    isPing x    = "PING :" `isPrefixOf` x
-    doPong x    = write h "PONG" (':' : drop 6 x)
+                          parseLine h (words s) >> listen h
+        where
+            isPing  = isPrefixOf "PING :"
+            doPong  = write h "PONG" . (':':) . drop 6
 
 joinChan :: Handle -> [String] -> IO ()
 joinChan h (x:xs)   = write h "JOIN" x >> joinChan h xs
 joinChan _ []       = return ()
 
 privmsg :: Handle -> String -> String -> IO ()
-privmsg h c s = write h "PRIVMSG" (c ++ " :" ++ s)
+privmsg h c s = write h "PRIVMSG" $ concat [c, " :", s]
 
 notice :: Handle -> String -> String -> IO ()
-notice h c s = write h "NOTICE" (c ++ " :" ++ s)
+notice h c s = write h "NOTICE" $ concat [c, " :", s]
 
 parseLine :: Handle -> [String] -> RandT (MarkovT IO) ()
 parseLine h (prefix:command:params)
@@ -153,15 +168,21 @@ handleMsg :: Handle -> String -> [String] -> RandT (MarkovT IO) ()
 handleMsg h prefix (chan:(_:operation):args)
         | member op opList  = liftIO ( printf "%s called %s in %s\n"
                                      senderNick
-                                     (op ++ foldl (++) "('" (intersperse "','" args) ++ "')")
+                                     (concat [op,
+                                              "('",
+                                              intercalate "','" args,
+                                              "')"])
                                      chan ) >>
                               hoist (hoist generalize) ((opList ! op) args) >>=
                               liftIO . ( notice h chan )
         | otherwise         = liftIO ( printf "%s said %s in %s\n"
                                        senderNick
-                                       (foldl (++) "" . intersperse " " $ operation:args)
+                                       (intercalate " " $ operation:args)
                                        chan ) >>
-                              lift ( hoist generalize $ catalog senderNick (operation:args) )
+                              lift ( hoist generalize $
+                                                catalog
+                                                (B.pack senderNick)
+                                                (map B.pack (operation:args)) )
         where
             op          = map toLower operation
             senderNick  = takeWhile (\c -> (c /='@') && (c /='!')) $ tail prefix
@@ -169,7 +190,7 @@ handleMsg _ _ _             = liftIO ( putStrLn "Couldn't handle message" )
 
 -- Pure
 
-catalog :: String -> [String] -> Markov ()
+catalog :: ByteString -> [ByteString] -> Markov ()
 catalog user []      = return ()
 catalog user words   = let
                          chainDiff = fromWalk stripMsg words
@@ -179,7 +200,7 @@ catalog user words   = let
                        in
                          modify (updateChain . updateAll)
                    where
-                       stripMsg :: String -> String
+                       stripMsg :: ByteString -> ByteString
                        stripMsg s = s
 
 markovAdd :: (Ord word) => MarkovChain word -> MarkovChain word -> MarkovChain word
@@ -216,18 +237,18 @@ toTransitions strip l   = helper $ (replicate (markovOrder) Nothing) ++ map (Jus
 
 imitateall :: [String] -> RandT Markov String
 imitateall seeds    = lift get >>= (\chains ->
-                        hoist generalize . runImitate seeds $
+                        hoist generalize . runImitate (map B.pack seeds) $
                             findWithDefault empty All chains ) >>=
-                      return . (\s -> colour 14 s)
+                      return . colour 14 . B.unpack
 
 imitate :: [String] -> RandT Markov String
 imitate []  = return $ colour 4 "...must construct additional pylons..."
 imitate (user:seeds)    = lift get >>= (\chains ->
-                            hoist generalize . runImitate seeds $
+                            hoist generalize . runImitate (map B.pack seeds) $
                                 case (readMaybe user :: Maybe Int) of
                                     Nothing ->
                                         let
-                                          key = Name user
+                                          key = Name $ B.pack user
                                         in
                                           findWithDefault empty key chains
                                     Just i  ->
@@ -235,19 +256,17 @@ imitate (user:seeds)    = lift get >>= (\chains ->
                                         snd $ elemAt i chains
                                       else
                                         let
-                                          key = Name user
+                                          key = Name $ B.pack user
                                         in
                                           findWithDefault empty key chains) >>=
-                          return . (\s -> "<"++user++"> "++(colour 10 s))
+                          return . ( colour 10 . B.unpack ) >>=
+                          return . (\s -> concat ["<", user, "> ", s])
 
-runImitate :: [String] -> MarkovChain String -> Rand String
+runImitate :: [ByteString] -> MarkovChain ByteString -> Rand ByteString
 runImitate seeds chain
-        | chain == empty    = return "-"
+        | chain == empty    = return $ B.singleton '-'
         | otherwise         = startWalk chain 40 seeds >>=
-                              return . joinMaybes
-        where
-            joinMaybes :: [Maybe String] -> String
-            joinMaybes = foldl (++) "" . intersperse " " . catMaybes
+                              return . B.unwords . catMaybes
 
 startWalk :: (Ord word, Show word) => MarkovChain word -> Int -> [word] -> Rand [Maybe word]
 startWalk chain _ _
@@ -316,8 +335,8 @@ choose choices  = (state . randomR) (0, length choices - 1) >>=
 
 colour :: Int -> String -> String
 colour i s
-        | (i > 0) && (i < 10)   = (toEnum 3):'0':(show i) ++ s
-        | (i > 0) && (i <= 15)  = (toEnum 3):(show i) ++ s
+        | (i > 0) && (i < 10)   = concat [[chr 3, '0'], (show i), s]
+        | (i > 0) && (i <= 15)  = concat [[chr 3], (show i), s]
 
 splitBy :: Eq a => a -> [a] -> [[a]]
 splitBy del str = helper del str []   

@@ -1,0 +1,13 @@
+name:               mako
+version:            1.0.0
+license:            MPL-2.0
+license-file:       LICENSE
+build-type:         Simple
+cabal-version:      >=1.2
+
+executable mako
+    main-is:        bot.hs
+    ghc-options:    -O2 -threaded -fprof-auto "-with-rtsopts=-N -p -s -h -i0.1"
+    build-depends:  base, containers, network, random,
+                    mmorph, lens, bytestring, text,
+                    directory, mtl
