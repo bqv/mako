@@ -34,8 +34,8 @@ import qualified Data.ByteString.Char8 as B
                               dropWhile, filter, cons, append, drop, take,
                               init, tail, split, length, isPrefixOf)
 import Data.HashMap (Map, empty, member, findWithDefault, fromList, (!), 
-                 unions, keys, insertWith, unionWith, toList,
-                 mapWithKey, fromListWith, fold, elems, size)
+                     unions, keys, insertWith, unionWith, toList,
+                     mapWithKey, fromListWith, fold, elems, size)
 
 server          = "irc.sublumin.al"
 port            = 6667
