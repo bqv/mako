@@ -17,11 +17,12 @@ import System.Directory (getDirectoryContents, doesFileExist)
 import System.IO (Handle, hSetBuffering, hGetLine, BufferMode(..), IOMode(..),
                   mkTextEncoding, withFile, hSetEncoding)
 
+import Data.Maybe (catMaybes)
 import Data.Char (toLower, chr)
 import Data.Monoid (mappend, mconcat)
-import Data.Maybe (catMaybes)
 import Data.Text.Encoding (decodeUtf8With)
 import Data.Text.Encoding.Error (lenientDecode)
+import Data.Hashable (Hashable, hashWithSalt, hash)
 import Data.Functor.Identity (Identity, runIdentity)
 import Data.List (isPrefixOf, elem, intersperse, sort, group, intercalate)
 import Data.ByteString.Builder (Builder, intDec, int8, char8, string8,
@@ -32,22 +33,21 @@ import qualified Data.ByteString.Char8 as B
                               lines, words, unwords, intercalate, concat,
                               dropWhile, filter, cons, append, drop, take,
                               init, tail, split, length, isPrefixOf)
-import Data.Map (Map, empty, member, findWithDefault, fromList, (!), 
-                 unions, mapKeys, keys, insertWith, unionWith, toList,
-                 mapWithKey, fromListWith, fold, elemAt, size)
+import Data.HashMap (Map, empty, member, findWithDefault, fromList, (!), 
+                 unions, keys, insertWith, unionWith, toList,
+                 mapWithKey, fromListWith, fold, elems, size)
 
 server          = "irc.sublumin.al"
 port            = 6667
 autojoinChan    = ["#spam"]
 nick            = "mako"
 markovOrder     = 2
-opList          = unions (map (\f ->
-                                    mapKeys f . fromList $
-                                                  [("imitate", imitate),
-                                                   ("im", imitate),
-                                                   ("speak", imitateall),
-                                                   ("imitateall", imitateall)])
-                              (map (:) ".!@"))
+opList          = fromList . concat -- Didn't happen >_<
+                           . map (\(a,b) -> map (flip (,) b . (:a)) ".!@") $
+                                                [("imitate", imitate),
+                                                 ("im", imitate),
+                                                 ("speak", imitateall),
+                                                 ("imitateall", imitateall)]
 
 type ByteString = B.ByteString
 
@@ -58,6 +58,10 @@ instance Ord a => Ord (Index a) where
     All <= Name a = True
     Name a <= Name b = a <= b
     _ <= _ = False
+
+instance Hashable a => Hashable (Index a) where
+    hashWithSalt s All = hashWithSalt s ()
+    hashWithSalt s (Name a) = hashWithSalt s a
 
 type FrequencyMap wordType = Map (Maybe wordType) Integer
 
@@ -203,17 +207,17 @@ catalog user words   = let
                        stripMsg :: ByteString -> ByteString
                        stripMsg s = s
 
-markovAdd :: (Ord word) => MarkovChain word -> MarkovChain word -> MarkovChain word
+markovAdd :: (Hashable word, Ord word) => MarkovChain word -> MarkovChain word -> MarkovChain word
 markovAdd large small   = unionWith freqAdd large small
 
-freqAdd :: (Ord word) => FrequencyMap word -> FrequencyMap word -> FrequencyMap word
+freqAdd :: (Hashable word, Ord word) => FrequencyMap word -> FrequencyMap word -> FrequencyMap word
 freqAdd large small = unionWith (+) large small
 
-fromWalk :: (Ord word) => (word -> word) -> [word] -> MarkovChain word
+fromWalk :: (Hashable word, Ord word) => (word -> word) -> [word] -> MarkovChain word
 fromWalk _ []       = empty
 fromWalk wrdfltr w  = mapWithKey (\k -> fromList) $ fromListWith (++) (transitionCount $ toTransitions wrdfltr $ w)
 
-transitionCount :: (Ord word) => [[Maybe word]] -> [([Maybe word], [(Maybe word, Integer)])]
+transitionCount :: (Hashable word, Ord word) => [[Maybe word]] -> [([Maybe word], [(Maybe word, Integer)])]
 transitionCount transitions = map collate (group (sort transitions))
                 where
                     collate :: [[word]] -> ([word], [(word, Integer)])
@@ -253,7 +257,7 @@ imitate (user:seeds)    = lift get >>= (\chains ->
                                           findWithDefault empty key chains
                                     Just i  ->
                                       if i >= 0 && i < size chains then
-                                        snd $ elemAt i chains
+                                        (!! i) $ elems chains
                                       else
                                         let
                                           key = Name $ B.pack user
@@ -268,7 +272,7 @@ runImitate seeds chain
         | otherwise         = startWalk chain 40 seeds >>=
                               return . B.unwords . catMaybes
 
-startWalk :: (Ord word, Show word) => MarkovChain word -> Int -> [word] -> Rand [Maybe word]
+startWalk :: (Hashable word, Ord word, Show word) => MarkovChain word -> Int -> [word] -> Rand [Maybe word]
 startWalk chain _ _
         | chain == empty    = error "(startWalk) This shouldn't happen"
 startWalk chain n []        = choose (keys chain) >>= \step ->
@@ -284,7 +288,7 @@ startWalk chain n seeds     = let
                                     walk chain n step >>=
                                     return . (++) step
 
-walk :: (Ord word, Show word) => MarkovChain word -> Int -> [Maybe word] -> Rand [Maybe word]
+walk :: (Hashable word, Ord word, Show word) => MarkovChain word -> Int -> [Maybe word] -> Rand [Maybe word]
 walk chain i last
         | i > 0     = step chain last >>= \next ->
                           trace ("Step from "++(show last)++" to "++(show next)) $
@@ -295,7 +299,7 @@ walk chain i last
                             return . (next :)
         | i == 0    = return last
 
-step :: (Ord word) => MarkovChain word -> [Maybe word] -> Rand (Maybe word)
+step :: (Hashable word, Ord word) => MarkovChain word -> [Maybe word] -> Rand (Maybe word)
 step chain current = let
                         freqMap = findWithDefault (fromList [(Nothing, 1)]) current chain
                      in
