@@ -4,13 +4,13 @@ import Debug.Trace (trace, traceShow, traceShowId)
 import Text.Read (readMaybe)
 import Text.Printf (hPrintf, printf)
 
-import Control.Applicative ()
-import Control.Lens.Tuple (_1)
-import Control.Lens ((&), (%~), over)
+import Control.Applicative ((<$>), (<*>), pure)
 import Control.Monad.Morph (hoist, generalize)
 import Control.Monad (foldM, ap, filterM, liftM, mapM)
 import Control.Monad.State.Strict (StateT, State, get, put, modify, gets,
                             state, liftIO, lift, evalStateT, evalState)
+import Control.Comonad (liftW, extend)
+import Control.Monad.Free (Free(..), liftF)
 
 import System.Random (randomR, newStdGen, StdGen, Random)
 import System.Directory (getDirectoryContents, doesFileExist)
