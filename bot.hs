@@ -1,12 +1,14 @@
+import Prelude hiding ()
+
 import Network (connectTo, PortID(PortNumber))
 import Debug.Trace (trace, traceShow, traceShowId)
 
 import Text.Read (readMaybe)
-import Text.Printf (hPrintf, printf)
+import Text.Printf (hPrintf)
 
 import Control.Applicative ((<$>), (<*>), pure)
 import Control.Monad.Morph (hoist, generalize)
-import Control.Monad (foldM, ap, filterM, liftM, mapM)
+import Control.Monad (foldM, filterM, liftM, mapM)
 import Control.Monad.State.Strict (StateT, State, get, put, modify, gets,
                             state, liftIO, lift, evalStateT, evalState)
 import Control.Comonad (liftW, extend)
@@ -15,41 +17,47 @@ import Control.Monad.Free (Free(..), liftF)
 import System.Random (randomR, newStdGen, StdGen, Random)
 import System.Directory (getDirectoryContents, doesFileExist)
 import System.IO (Handle, hSetBuffering, hGetLine, BufferMode(..), IOMode(..),
-                  mkTextEncoding, withFile, hSetEncoding)
+                  mkTextEncoding, withFile, hSetEncoding, stdout)
 
 import Data.Maybe (catMaybes)
 import Data.Char (toLower, chr)
 import Data.Monoid (mappend, mconcat)
-import Data.Text.Encoding (decodeUtf8With)
-import Data.Text.Encoding.Error (lenientDecode)
 import Data.Hashable (Hashable, hashWithSalt, hash)
 import Data.Functor.Identity (Identity, runIdentity)
-import Data.List (isPrefixOf, elem, intersperse, sort, group, intercalate)
-import Data.ByteString.Builder (Builder, intDec, int8, char8, string8,
-                                byteString, toLazyByteString)
+import qualified Data.List as List
+                            (isPrefixOf, elem, intersperse, sort, group,
+                             intercalate, map)
+import qualified Data.ByteString.Builder as B
+                            (Builder, intDec, int8, char8, string8,
+                             byteString, toLazyByteString)
 import qualified Data.ByteString.Char8 as B
-                             (ByteString, singleton, pack, unpack,
-                              hGetContents, hPutStr, hPutStrLn, hGetLine,
-                              lines, words, unwords, intercalate, concat,
-                              dropWhile, filter, cons, append, drop, take,
-                              init, tail, split, length, isPrefixOf)
-import Data.HashMap (Map, empty, member, findWithDefault, fromList, (!), 
+                            (ByteString, singleton, pack, unpack,
+                             hGetContents, hPutStr, hPutStrLn, hGetLine,
+                             lines, words, unwords, intercalate, concat,
+                             dropWhile, filter, cons, append, drop, take,
+                             init, tail, split, length, isPrefixOf)
+import qualified Data.Map.Strict as Map (Map, empty, member, findWithDefault, fromList, (!), 
                      unions, keys, insertWith, unionWith, toList,
-                     mapWithKey, fromListWith, fold, elems, size)
+                     mapWithKey, fromListWith, foldr, elems, size)
+import qualified Data.HashMap as H (Map, empty, member, findWithDefault, fromList, (!), 
+                     unions, keys, insertWith, unionWith, toList,
+                     mapWithKey, fromListWith, fold , elems, size)
 
 server          = "irc.sublumin.al"
 port            = 6667
 autojoinChan    = ["#spam"]
 nick            = "mako"
 markovOrder     = 2
-opList          = fromList . concat -- Didn't happen >_<
-                           . map (\(a,b) -> map (flip (,) b . (:a)) ".!@") $
-                                                [("imitate", imitate),
-                                                 ("im", imitate),
-                                                 ("speak", imitateall),
-                                                 ("imitateall", imitateall)]
+opList          = Map.fromList . concat -- Didn't happen >_<
+                               . map (\(a,b) -> map (flip (,) b . (:a)) ".!@") $
+                                                    [("imitate", imitate),
+                                                     ("im", imitate),
+                                                     ("speak", imitateall),
+                                                     ("imitateall", imitateall)]
 
+type Map = Map.Map
 type ByteString = B.ByteString
+type HashMap = H.Map
 
 data Index keyType = All | Name keyType deriving (Eq)
 
@@ -76,11 +84,26 @@ type RandT = StateT StdGen
 type Markov = State (ChainList ByteString ByteString)
 type MarkovT = StateT (ChainList ByteString ByteString)
 
-main :: IO ()
-main    = newStdGen >>= \gen ->
-              evalStateT (evalStateT (lift loadLogs >> connect) gen) empty
+type Imitate a = RandT Markov a
+type ImitateIO a = RandT (MarkovT IO) a
 
-connect :: RandT (MarkovT IO) ()
+runImitateIO :: ImitateIO a -> IO a
+runImitateIO im = newStdGen >>= \gen ->
+                      evalStateT (evalStateT im gen) Map.empty
+
+imIO :: Imitate a -> ImitateIO a
+imIO    = hoist $ hoist generalize
+
+main :: IO ()
+main    = runImitateIO (prepare >> connect >>= listen)
+
+prepare :: ImitateIO ()
+prepare = liftIO (
+            hSetBuffering stdout LineBuffering ) >>
+          lift loadLogs >>
+          return ()
+
+connect :: ImitateIO Handle
 connect = liftIO ( (connectTo server . PortNumber . fromIntegral $ port) >>=
           \h ->
             mkTextEncoding "UTF-8//IGNORE" >>=
@@ -88,27 +111,26 @@ connect = liftIO ( (connectTo server . PortNumber . fromIntegral $ port) >>=
             hSetBuffering h NoBuffering >>
             write h "USER" "markovbot 0 * :Markov bot" >>
             write h "NICK" nick >>
-            return h ) >>=
-          listen
+            return h )
 
 loadLogs :: MarkovT IO [[()]]
 loadLogs    = let
                 folders = [ "/srv/log/subluminal/#programming/" ]
               in
                 liftIO (
-                    (fmap concat . sequence . map getDir $ folders) >>=
+                    (fmap concat . sequence . List.map getDir $ folders) >>=
                     filterM doesFileExist ) >>= 
                 mapM importLog
             where
                 getDir :: FilePath -> IO [FilePath]
-                getDir p = fmap (fmap (++) [p] `ap`)
+                getDir p = fmap (List.map (++) [p] <*>)
                                 $ getDirectoryContents p
 
 importLog :: FilePath -> MarkovT IO [()]
 importLog path  = liftIO (
-                    printf "Loading %s...\n" path >>
+                    mapM_ putStr ["Loading ", path, "...\n"] >>
                     withFile path ReadMode B.hGetContents >>=
-                    return . map processLogLine . B.lines ) >>=
+                    return . List.map processLogLine . B.lines ) >>=
                   \logs ->
                         hoist generalize ((mapM . uncurry $! catalog) logs)
 
@@ -133,9 +155,9 @@ readUTF8File path = withFile path ReadMode (\fd ->
 
 write :: Handle -> String -> String -> IO ()
 write h s t     = hPrintf h "%s %s\r\n" s t >>
-                  printf "=>> %s %s\n" s t
+                  mapM_ putStr ["=>> ", s, " ", t, "\n"]
 
-listen :: Handle -> RandT (MarkovT IO) ()
+listen :: Handle -> ImitateIO ()
 listen h    = liftIO (hGetLine h) >>=
               \t -> let
                       s = init t
@@ -146,7 +168,7 @@ listen h    = liftIO (hGetLine h) >>=
                       else
                           parseLine h (words s) >> listen h
         where
-            isPing  = isPrefixOf "PING :"
+            isPing  = List.isPrefixOf "PING :"
             doPong  = write h "PONG" . (':':) . drop 6
 
 joinChan :: Handle -> [String] -> IO ()
@@ -159,7 +181,7 @@ privmsg h c s = write h "PRIVMSG" $ concat [c, " :", s]
 notice :: Handle -> String -> String -> IO ()
 notice h c s = write h "NOTICE" $ concat [c, " :", s]
 
-parseLine :: Handle -> [String] -> RandT (MarkovT IO) ()
+parseLine :: Handle -> [String] -> ImitateIO ()
 parseLine h (prefix:command:params)
         | command == "001"      = liftIO ( write h "UMODE2" "+B" >>
                                            joinChan h autojoinChan )
@@ -168,27 +190,28 @@ parseLine h (prefix:command:params)
         | otherwise             = return () -- Ignore
 parseLine _ _                   = liftIO ( putStrLn "Couldn't parse line" )
 
-handleMsg :: Handle -> String -> [String] -> RandT (MarkovT IO) ()
+handleMsg :: Handle -> String -> [String] -> ImitateIO ()
 handleMsg h prefix (chan:(_:operation):args)
-        | member op opList  = liftIO ( printf "%s called %s in %s\n"
-                                     senderNick
-                                     (concat [op,
-                                              "('",
-                                              intercalate "','" args,
-                                              "')"])
-                                     chan ) >>
-                              hoist (hoist generalize) ((opList ! op) args) >>=
-                              liftIO . ( notice h chan )
-        | otherwise         = liftIO ( printf "%s said %s in %s\n"
-                                       senderNick
-                                       (intercalate " " $ operation:args)
-                                       chan ) >>
-                              lift ( hoist generalize $
-                                                catalog
-                                                (B.pack senderNick)
-                                                (map B.pack (operation:args)) )
+        | Map.member op opList  = liftIO (  mapM_ putStr [senderNick
+                                                        ," called "
+                                                        ,(concat [op
+                                                                ,"('"
+                                                                ,List.intercalate "','" args
+                                                                ,"')"])
+                                                        ," in "
+                                                        ,chan
+                                                        ,"\n"] ) >> 
+                                  imIO ((opList Map.! op) args) >>=
+                                  liftIO . ( notice h chan )
+        | otherwise         = liftIO (  mapM_ putStr [senderNick
+                                                    ," said "
+                                                    ,(List.intercalate " " $ operation:args)
+                                                    ," in "
+                                                    ,chan
+                                                    ,"\n"] ) >>
+                              imIO ( lift ( catalog (B.pack senderNick) (List.map B.pack (operation:args)) ) )
         where
-            op          = map toLower operation
+            op          = List.map toLower operation
             senderNick  = takeWhile (\c -> (c /='@') && (c /='!')) $ tail prefix
 handleMsg _ _ _             = liftIO ( putStrLn "Couldn't handle message" )
 
@@ -199,8 +222,8 @@ catalog user []      = return ()
 catalog user words   = let
                          chainDiff = fromWalk stripMsg words
                          key = Name user
-                         updateChain = insertWith markovAdd key chainDiff
-                         updateAll = insertWith markovAdd All chainDiff
+                         updateChain = Map.insertWith markovAdd key chainDiff
+                         updateAll = Map.insertWith markovAdd All chainDiff
                        in
                          modify (updateChain . updateAll)
                    where
@@ -208,17 +231,17 @@ catalog user words   = let
                        stripMsg s = s
 
 markovAdd :: (Hashable word, Ord word) => MarkovChain word -> MarkovChain word -> MarkovChain word
-markovAdd large small   = unionWith freqAdd large small
+markovAdd large small   = Map.unionWith freqAdd large small
 
 freqAdd :: (Hashable word, Ord word) => FrequencyMap word -> FrequencyMap word -> FrequencyMap word
-freqAdd large small = unionWith (+) large small
+freqAdd large small = Map.unionWith (+) large small
 
 fromWalk :: (Hashable word, Ord word) => (word -> word) -> [word] -> MarkovChain word
-fromWalk _ []       = empty
-fromWalk wrdfltr w  = mapWithKey (\k -> fromList) $ fromListWith (++) (transitionCount $ toTransitions wrdfltr $ w)
+fromWalk _ []       = Map.empty
+fromWalk wrdfltr w  = Map.mapWithKey (\k -> Map.fromList) $ Map.fromListWith (++) (transitionCount $ toTransitions wrdfltr $ w)
 
 transitionCount :: (Hashable word, Ord word) => [[Maybe word]] -> [([Maybe word], [(Maybe word, Integer)])]
-transitionCount transitions = map collate (group (sort transitions))
+transitionCount transitions = List.map collate (List.group (List.sort transitions))
                 where
                     collate :: [[word]] -> ([word], [(word, Integer)])
                     collate l = (init $ head l, [(last $ head l, toInteger $ length l)])
@@ -239,13 +262,13 @@ toTransitions strip l   = helper $ (replicate (markovOrder) Nothing) ++ map (Jus
 --      Empty list -> Return Nothing ✔
 --      Otherwise  -> Select from list keys where max intersection 
 
-imitateall :: [String] -> RandT Markov String
+imitateall :: [String] -> Imitate String
 imitateall seeds    = lift get >>= (\chains ->
                         hoist generalize . runImitate (map B.pack seeds) $
-                            findWithDefault empty All chains ) >>=
+                            Map.findWithDefault Map.empty All chains ) >>=
                       return . colour 14 . B.unpack
 
-imitate :: [String] -> RandT Markov String
+imitate :: [String] -> Imitate String
 imitate []  = return $ colour 4 "...must construct additional pylons..."
 imitate (user:seeds)    = lift get >>= (\chains ->
                             hoist generalize . runImitate (map B.pack seeds) $
@@ -254,34 +277,34 @@ imitate (user:seeds)    = lift get >>= (\chains ->
                                         let
                                           key = Name $ B.pack user
                                         in
-                                          findWithDefault empty key chains
+                                          Map.findWithDefault Map.empty key chains
                                     Just i  ->
-                                      if i >= 0 && i < size chains then
-                                        (!! i) $ elems chains
+                                      if i >= 0 && i < Map.size chains then
+                                        (!! i) $ Map.elems chains
                                       else
                                         let
                                           key = Name $ B.pack user
                                         in
-                                          findWithDefault empty key chains) >>=
+                                          Map.findWithDefault Map.empty key chains) >>=
                           return . ( colour 10 . B.unpack ) >>=
                           return . (\s -> concat ["<", user, "> ", s])
 
 runImitate :: [ByteString] -> MarkovChain ByteString -> Rand ByteString
 runImitate seeds chain
-        | chain == empty    = return $ B.singleton '-'
+        | chain == Map.empty    = return $ B.singleton '-'
         | otherwise         = startWalk chain 40 seeds >>=
                               return . B.unwords . catMaybes
 
 startWalk :: (Hashable word, Ord word, Show word) => MarkovChain word -> Int -> [word] -> Rand [Maybe word]
 startWalk chain _ _
-        | chain == empty    = error "(startWalk) This shouldn't happen"
-startWalk chain n []        = choose (keys chain) >>= \step ->
+        | chain == Map.empty    = error "(startWalk) This shouldn't happen"
+startWalk chain n []        = choose (Map.keys chain) >>= \step ->
                                 walk chain n step >>=
                                 return . (++) step
 startWalk chain n seeds     = let
-                                keyList = keys chain
+                                keyList = Map.keys chain
                                 candidates = findMaxSetIntersectionList
-                                                    (map Just seeds)
+                                                    (List.map Just seeds)
                                                     keyList
                               in
                                 choose candidates >>= \step ->
@@ -301,7 +324,7 @@ walk chain i last
 
 step :: (Hashable word, Ord word) => MarkovChain word -> [Maybe word] -> Rand (Maybe word)
 step chain current = let
-                        freqMap = findWithDefault (fromList [(Nothing, 1)]) current chain
+                        freqMap = Map.findWithDefault (Map.fromList [(Nothing, 1)]) current chain
                      in
                         sample freqMap 
 
@@ -323,9 +346,9 @@ findMaxSetIntersectionList stableSet setList =
 
 sample :: FrequencyMap word -> Rand (Maybe word)
 sample choiceMap    = (state . randomR) (0, total-1) >>=
-                      return . search (toList choiceMap)
+                      return . search (Map.toList choiceMap)
         where
-            total = fold (+) 0 choiceMap
+            total = Map.foldr (+) 0 choiceMap
             search mapList val = case mapList of
                             ((a,b):xs)  -> if val >= b then search xs (val - b) else a
                             []          -> error "(sample) This shouldn't happen"
