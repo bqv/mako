@@ -1,59 +1,86 @@
+module Mako (
+    main
+) where
+
 import Prelude hiding ()
 
-import Network (connectTo, PortID(PortNumber))
+import qualified Config (serverHost, serverPort, autoJoin, botNick, markovOrder, opList)
+import qualified IrcServer as Irc (connect, listen)
+
+import Control.Monad.Free (Free(..), liftF)
+
 import Debug.Trace (trace, traceShow, traceShowId)
 
 import Text.Read (readMaybe)
-import Text.Printf (hPrintf)
 
+import System.IO (IOMode(..), BufferMode(..), withFile)
 import Control.Applicative ((<$>), (<*>), pure)
 import Control.Monad.Morph (hoist, generalize)
 import Control.Monad (foldM, filterM, liftM, mapM)
 import Control.Monad.State.Strict (StateT, State, get, put, modify, gets,
                             state, liftIO, lift, evalStateT, evalState)
 import Control.Comonad (liftW, extend)
-import Control.Monad.Free (Free(..), liftF)
 
 import System.Random (randomR, newStdGen, StdGen, Random)
 import System.Directory (getDirectoryContents, doesFileExist)
-import System.IO (Handle, hSetBuffering, hGetLine, BufferMode(..), IOMode(..),
-                  mkTextEncoding, withFile, hSetEncoding, stdout)
 
 import Data.Maybe (catMaybes)
 import Data.Char (toLower, chr)
 import Data.Monoid (mappend, mconcat)
 import Data.Hashable (Hashable, hashWithSalt, hash)
 import Data.Functor.Identity (Identity, runIdentity)
-import qualified Data.List as List
-                            (isPrefixOf, elem, intersperse, sort, group,
-                             intercalate, map)
-import qualified Data.ByteString.Builder as B
-                            (Builder, intDec, int8, char8, string8,
-                             byteString, toLazyByteString)
-import qualified Data.ByteString.Char8 as B
-                            (ByteString, singleton, pack, unpack,
-                             hGetContents, hPutStr, hPutStrLn, hGetLine,
-                             lines, words, unwords, intercalate, concat,
-                             dropWhile, filter, cons, append, drop, take,
-                             init, tail, split, length, isPrefixOf)
-import qualified Data.Map.Strict as Map (Map, empty, member, findWithDefault, fromList, (!), 
-                     unions, keys, insertWith, unionWith, toList,
-                     mapWithKey, fromListWith, foldr, elems, size)
 import qualified Data.HashMap as H (Map, empty, member, findWithDefault, fromList, (!), 
                      unions, keys, insertWith, unionWith, toList,
                      mapWithKey, fromListWith, fold , elems, size)
 
-server          = "irc.sublumin.al"
-port            = 6667
-autojoinChan    = ["#spam"]
-nick            = "mako"
-markovOrder     = 2
-opList          = Map.fromList . concat -- Didn't happen >_<
-                               . map (\(a,b) -> map (flip (,) b . (:a)) ".!@") $
-                                                    [("imitate", imitate),
-                                                     ("im", imitate),
-                                                     ("speak", imitateall),
-                                                     ("imitateall", imitateall)]
+data BotActionF next
+    = Prepare next
+    | Connect host port (sock -> next)
+    | Listen sock next
+    | Stop
+    deriving (Eq, Show)
+
+instance Functor BotActionF where
+    fmap f (Prepare n)      = Prepare (f n)
+    fmap f (Connect h p g)  = Connect h p (f . g)
+    fmap f (Listen s n)     = Listen s (f n)
+    fmap f Stop             = Stop
+
+type BotAction  = Free BotActionF
+
+prepare :: BotAction ()
+prepare = liftF $ Prepare ()
+
+connect :: String -> Int -> BotAction socket
+connect host port = liftF $ Connect host port id
+
+listen :: socket -> BotAction ()
+listen handle = liftF $ Listen handle ()
+
+stop :: BotAction ()
+stop = liftF $ Stop
+
+runBot :: BotAction a -> IO a
+runBot (Pure a)               = return a
+runBot (Free (Prepare n))     = hSetBuffering stdout LineBuffering >>
+                                forkIO Markov.runMarkov
+                                runBot n
+runBot (Free (Connect h p g)) = Irc.connect h p >>= 
+                                runBot . g
+runBot (Free (Listen s n))    = Irc.listen s >>=
+                                runBot n
+runBot (Free (Stop))          = return ()
+
+mako :: BotAction ()
+mako  = prepare >>
+        connect Config.serverHost Config.serverIP >>=
+        listen >>
+        stop
+
+main :: IO ()
+main  = runBot mako
+
+-- Code
 
 type Map = Map.Map
 type ByteString = B.ByteString
@@ -94,25 +121,6 @@ runImitateIO im = newStdGen >>= \gen ->
 imIO :: Imitate a -> ImitateIO a
 imIO    = hoist $ hoist generalize
 
-main :: IO ()
-main    = runImitateIO (prepare >> connect >>= listen)
-
-prepare :: ImitateIO ()
-prepare = liftIO (
-            hSetBuffering stdout LineBuffering ) >>
-          lift loadLogs >>
-          return ()
-
-connect :: ImitateIO Handle
-connect = liftIO ( (connectTo server . PortNumber . fromIntegral $ port) >>=
-          \h ->
-            mkTextEncoding "UTF-8//IGNORE" >>=
-            hSetEncoding h >>
-            hSetBuffering h NoBuffering >>
-            write h "USER" "markovbot 0 * :Markov bot" >>
-            write h "NICK" nick >>
-            return h )
-
 loadLogs :: MarkovT IO [[()]]
 loadLogs    = let
                 folders = [ "/srv/log/subluminal/#programming/" ]
@@ -152,68 +160,6 @@ readUTF8File path = withFile path ReadMode (\fd ->
                         mkTextEncoding "UTF-8//IGNORE" >>=
                         hSetEncoding fd >>
                         B.hGetContents fd )
-
-write :: Handle -> String -> String -> IO ()
-write h s t     = hPrintf h "%s %s\r\n" s t >>
-                  mapM_ putStr ["=>> ", s, " ", t, "\n"]
-
-listen :: Handle -> ImitateIO ()
-listen h    = liftIO (hGetLine h) >>=
-              \t -> let
-                      s = init t
-                    in
-                      liftIO (putStrLn s) >>
-                      if isPing s then
-                          liftIO (doPong s) >> listen h
-                      else
-                          parseLine h (words s) >> listen h
-        where
-            isPing  = List.isPrefixOf "PING :"
-            doPong  = write h "PONG" . (':':) . drop 6
-
-joinChan :: Handle -> [String] -> IO ()
-joinChan h (x:xs)   = write h "JOIN" x >> joinChan h xs
-joinChan _ []       = return ()
-
-privmsg :: Handle -> String -> String -> IO ()
-privmsg h c s = write h "PRIVMSG" $ concat [c, " :", s]
-
-notice :: Handle -> String -> String -> IO ()
-notice h c s = write h "NOTICE" $ concat [c, " :", s]
-
-parseLine :: Handle -> [String] -> ImitateIO ()
-parseLine h (prefix:command:params)
-        | command == "001"      = liftIO ( write h "UMODE2" "+B" >>
-                                           joinChan h autojoinChan )
-        | command == "INVITE"   = liftIO ( joinChan h (tail params) )
-        | command == "PRIVMSG"  = handleMsg h prefix params
-        | otherwise             = return () -- Ignore
-parseLine _ _                   = liftIO ( putStrLn "Couldn't parse line" )
-
-handleMsg :: Handle -> String -> [String] -> ImitateIO ()
-handleMsg h prefix (chan:(_:operation):args)
-        | Map.member op opList  = liftIO (  mapM_ putStr [senderNick
-                                                        ," called "
-                                                        ,(concat [op
-                                                                ,"('"
-                                                                ,List.intercalate "','" args
-                                                                ,"')"])
-                                                        ," in "
-                                                        ,chan
-                                                        ,"\n"] ) >> 
-                                  imIO ((opList Map.! op) args) >>=
-                                  liftIO . ( notice h chan )
-        | otherwise         = liftIO (  mapM_ putStr [senderNick
-                                                    ," said "
-                                                    ,(List.intercalate " " $ operation:args)
-                                                    ," in "
-                                                    ,chan
-                                                    ,"\n"] ) >>
-                              imIO ( lift ( catalog (B.pack senderNick) (List.map B.pack (operation:args)) ) )
-        where
-            op          = List.map toLower operation
-            senderNick  = takeWhile (\c -> (c /='@') && (c /='!')) $ tail prefix
-handleMsg _ _ _             = liftIO ( putStrLn "Couldn't handle message" )
 
 -- Pure
 

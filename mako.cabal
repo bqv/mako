@@ -6,7 +6,7 @@ build-type:         Simple
 cabal-version:      >=1.2
 
 executable mako
-    main-is:        bot.hs
+    main-is:        Mako.hs
     ghc-options:    -O2 -threaded -fprof-auto "-with-rtsopts=-N -p -s -h -i0.1"
     build-depends:  base, containers, network, random,
                     mmorph, lens, bytestring, text,
