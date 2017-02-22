@@ -19,6 +19,8 @@ import Control.Monad.Writer.Lazy (Writer(..), execWriter, tell)
 import qualified Data.List as List (intercalate, map, concatMap)
 import qualified Data.Map as Map (Map(..), lookup)
 
+import Debug.Trace
+
 type Map = Map.Map
 type Text = T.Text
 
@@ -120,13 +122,13 @@ instance Show Message where
                                         showChar ' ' . showsPrec x param
 
 instance Read Message where
-    readsPrec x (':':line)  = let
-                                (pfx, ' ':msg) = head . lex $ line
-                                (cmd, ' ':params) = head . lex $ msg
+    readsPrec x (':':line)  = let 
+                                (pfx, ' ':msg) = break (==' ') line
+                                (cmd, ' ':params) = break (==' ') msg
                               in
                                 return (Message (Just $ read pfx) (read cmd) (read params), "")
     readsPrec x msg         = let
-                                (cmd, ' ':params) = head . lex $ msg
+                                (cmd, ' ':params) = break (==' ') msg
                               in
                                 return (Message Nothing (read cmd) (read params), "")
 

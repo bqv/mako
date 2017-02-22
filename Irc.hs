@@ -16,7 +16,7 @@ import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar(..), newTVar, readTVar, writeTVar)
 
 import Control.Monad.State (StateT(..), execStateT, get, put, gets, modify)
-import Control.Monad.Reader (ReaderT(..), runReaderT, asks, reader, liftIO)
+import Control.Monad.Reader (ReaderT(..), runReaderT, ask, asks, reader, liftIO)
 import Control.Monad.Writer.Lazy (WriterT(..), execWriterT, tell)
 import Control.Monad.Free (Free(..), liftF)
 import Control.Monad.Trans (lift)
@@ -100,10 +100,13 @@ handleMessage = asks command >>=
         where
             dispatch :: Command -> WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
             dispatch Privmsg    = handlePrivmsg
-            dispatch _          = return ()
+            dispatch _          = handleOther
 
 handlePrivmsg :: WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
-handlePrivmsg = tell [Log.info "hi"]
+handlePrivmsg = lift ask >>= \msg -> tell [Log.info $ show msg]
+
+handleOther :: WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
+handleOther = lift ask >>= \msg -> tell [Log.debug $ show msg]
 
 startHandler :: IrcConnection -> IO ()
 startHandler ic = runReaderT (runHandler theHandler) ic
