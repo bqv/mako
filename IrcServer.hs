@@ -1,8 +1,10 @@
 module IrcServer (
+    IrcServer(..),
+    IrcConnection(..),
     connect,
+    register,
     listen,
-    work,
-    parseLine
+    send
 ) where
 
 import Config
@@ -17,14 +19,27 @@ import System.IO (Handle, hSetBuffering, BufferMode(..), hGetLine,
                   mkTextEncoding, hSetEncoding, stdout, hSetNewlineMode,
                   NewlineMode(..), Newline(..))
 
-import Control.Concurrent (forkIO, ThreadId)
+import Control.Concurrent (forkIO, forkFinally, ThreadId)
 import Control.Concurrent.Chan (Chan(..), newChan, writeChan, readChan, getChanContents)
-import Control.Concurrent.MVar (MVar(..), newMVar, readMVar, putMVar)
+import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM.TVar (TVar(..), newTVar, readTVar, writeTVar)
 
 import Control.Exception (IOException, handle)
 
-import Control.Monad (forever)
-import Control.Monad.Reader (ReaderT(..), runReaderT, ask)
+import Control.Monad (forever, ap)
+import Control.Monad.Reader (ReaderT(..), runReaderT, ask, reader, liftIO)
+
+data IrcServer = IrcServer {
+                    host :: String,
+                    port :: Int,
+                    ssl :: Bool
+                 }
+
+data IrcConnection = IrcConnection {
+                        readQ :: Chan Message,
+                        sendQ :: Chan Message,
+                        connected :: TVar Bool
+                     }
 
 connect :: String -> Int -> IO Handle
 connect server port = connectTo server portno >>=
@@ -38,49 +53,33 @@ connect server port = connectTo server portno >>=
             portno = PortNumber . fromIntegral $ port
             nlCRLFMode = NewlineMode CRLF CRLF
 
-register :: Handle -> String -> String -> Maybe String -> IO ()
-register h n u p = write h (irc_user u "Monad bot") >>
-                   write h (irc_nick n) >>
-                   maybe (return ()) (write h . irc_pass) p
+register :: String -> String -> Maybe String -> ReaderT Handle IO ()
+register n u p = send (irc_user u "Monad bot") >>
+                 send (irc_nick n) >>
+                 maybe (return ()) (send . irc_pass) p
 
-listen :: Handle -> IO (Chan Message, Chan Message)
-listen h =  register h "bot" "monadbot" Nothing >>
-            makeChans >>= \(inp, out) ->
-              forkIO (forever $ hGetLine h >>=
-                                writeOut inp >>
-                                readIn out) >>
-              return (inp, out)
+
+listen :: ReaderT Handle IO IrcConnection
+listen = reader (flip (,)) `ap` makeConn >>= \(ic, h) ->
+            (loopWithState (connected ic) $ hGetLine h >>=
+                                            readOnto (readQ ic) >>
+                                            writeOnto h (sendQ ic)) >>
+            return ic
         where
-            writeOut :: Chan Message -> String -> IO ()
-            writeOut inp st = putStrLn st >>
+            readOnto :: Chan Message -> String -> IO ()
+            readOnto inp st = putStrLn st >>
                               writeChan inp (read st)
-            readIn :: Chan Message -> IO ()
-            readIn out = getChanContents out >>=
-                         mapM_ (write h)
-            makeChans :: IO (Chan Message, Chan Message)
-            makeChans = newChan >>= \input ->
-                        newChan >>= \output ->
-                        return (input, output)
+            writeOnto :: Handle -> Chan Message -> IO ()
+            writeOnto h out = getChanContents out >>=
+                              mapM_ (write h)
+            makeConn :: ReaderT Handle IO IrcConnection
+            makeConn = liftIO newChan >>= \input ->
+                       liftIO newChan >>= \output ->
+                       liftIO (atomically $ newTVar True) >>= \state ->
+                           return (IrcConnection input output state)
+            loopWithState :: TVar Bool -> IO a -> ReaderT Handle IO ThreadId
+            loopWithState tv io = liftIO $ forkFinally (forever io) (const . atomically $ writeTVar tv False) 
 
-work :: Handle -> (Message -> Writer [Message] ()) -> IO ()
-work h fn = register h "bot" "monadbot" Nothing >>
-            safely (forever $ hGetLine h >>= fork) >>
-            return ()
-        where
-            safely :: IO () -> IO ()
-            safely = handle (print :: IOException -> IO ())
-            fork :: String -> IO ThreadId
-            fork st = forkIO $ putStrLn st >>
-                               (mapM_ (write h) $ execWriter . fn $ read st)
-
-type Net = ReaderT Handle IO
-
-data IrcConnection = IrcConnection {
-                        readQ :: Chan Message,
-                        sendQ :: Chan Message
-                     }
-
-type IRC = ReaderT IrcConnection IO
-
-
+send :: Message -> ReaderT Handle IO ()
+send msg = ReaderT (flip write msg)
 
