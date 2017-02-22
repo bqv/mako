@@ -3,9 +3,11 @@ module Irc (
     IrcServer(..)
 ) where
 
-import IrcServer (IrcServer(..), IrcConnection(..), connect, register, listen)
+import Prelude hiding (log)
+
+import IrcServer (IrcServer(..), IrcConnection(..), connect, listen)
 import IrcMessage
-import Logging
+import qualified Logging as Log
 
 import Data.Char (chr)
 
@@ -13,21 +15,26 @@ import Control.Concurrent.Chan (writeChan, readChan, getChanContents)
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar(..), newTVar, readTVar, writeTVar)
 
+import Control.Monad.State (StateT(..), execStateT, get, put, gets, modify)
 import Control.Monad.Reader (ReaderT(..), runReaderT, asks, reader, liftIO)
-import Control.Monad.Writer.Lazy (WriterT(..), execWriter, tell)
+import Control.Monad.Writer.Lazy (WriterT(..), execWriterT, tell)
 import Control.Monad.Free (Free(..), liftF)
 import Control.Monad.Trans (lift)
+
+import Control.Conditional (if', ifM)
 
 data IrcF next
     = Send Message next
     | Receive (Message -> next)
     | IsConnected (Bool -> next)
+    | Log Log.Entry next
     | Stop
 
 instance Functor IrcF where
     fmap f (Send m n)       = Send m (f n)
     fmap f (Receive g)      = Receive (f . g)
     fmap f (IsConnected g)  = IsConnected (f . g)
+    fmap f (Log s n)        = Log s (f n)
     fmap f Stop             = Stop
 
 send :: Message -> Free IrcF ()
@@ -38,6 +45,9 @@ receive = liftF $ Receive id
 
 isConnected :: Free IrcF Bool
 isConnected = liftF $ IsConnected id
+
+log :: Log.Entry -> Free IrcF ()
+log entry = liftF $ Log entry ()
 
 stop :: Free IrcF ()
 stop = liftF $ Stop
@@ -53,14 +63,55 @@ runHandler (Free (Receive g))        = asks readQ >>=
 runHandler (Free (IsConnected g))    = asks connected >>=
                                        liftIO . atomically . readTVar >>=
                                        runHandler . g
+runHandler (Free (Log s n))          = liftIO (Log.write s) >>
+                                       runHandler n
 runHandler (Free (Stop))             = return ()
 
 startWorker :: IrcServer -> IO IrcConnection
 startWorker is = connect (IrcServer.host is) (IrcServer.port is) >>=
-                 runReaderT (register "bot" "monadbot" Nothing >> listen)
+                 runReaderT listen
 
-handle :: IrcConnection -> WriterT [LogMessage] (ReaderT IrcConnection (Free IrcF)) ()
-handle = const $ return ()
+data Data = Data { registered :: Bool }
+
+register :: String -> String -> Maybe String -> StateT Data (Free IrcF) ()
+register n u p = ifM (gets registered) (lift tryRegister >> expectWelcome) (return ())
+        where
+            tryRegister :: Free IrcF ()
+            tryRegister = send (irc_user u "Monad bot") >>
+                          send (irc_nick n) >>
+                          maybe (return ()) (send . irc_pass) p
+            expectWelcome :: StateT Data (Free IrcF) ()
+            expectWelcome = lift receive >>=
+                            return . (== Numeric Welcome) . command >>=
+                            setRegistered >>
+                            register n u p
+            setRegistered :: Bool -> StateT Data (Free IrcF) ()
+            setRegistered val = modify (\d -> d { registered = val })
+
+handler :: StateT Data (Free IrcF) ()
+handler = lift receive >>=
+          runReaderT handleMessage >>
+          ifM (lift isConnected) handler (return ())
+
+handleMessage :: ReaderT Message (StateT Data (Free IrcF)) ()
+handleMessage = asks command >>=
+                execWriterT . dispatch >>=
+                lift . lift . mapM_ log
+        where
+            dispatch :: Command -> WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
+            dispatch Privmsg    = handlePrivmsg
+            dispatch _          = return ()
+
+handlePrivmsg :: WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
+handlePrivmsg = tell [Log.info "hi"]
+
+startHandler :: IrcConnection -> IO ()
+startHandler ic = runReaderT (runHandler theHandler) ic
+        where
+            theHandler :: Free IrcF ()
+            theHandler = execStateT (register "bot" "monadbot" Nothing >> handler) theData >> return ()
+            theData :: Data
+            theData = Data { registered = False }
 
 colour :: Int -> String -> String
 colour i s

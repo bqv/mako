@@ -11,4 +11,4 @@ executable mako
     build-depends:  base, containers, network, random,
                     mmorph, lens, bytestring, text,
                     directory, mtl, hashable, hashmap,
-                    comonad, free, stm
+                    comonad, free, stm, cond

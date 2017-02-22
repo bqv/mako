@@ -2,7 +2,6 @@ module IrcServer (
     IrcServer(..),
     IrcConnection(..),
     connect,
-    register,
     listen,
     send
 ) where
@@ -52,12 +51,6 @@ connect server port = connectTo server portno >>=
         where
             portno = PortNumber . fromIntegral $ port
             nlCRLFMode = NewlineMode CRLF CRLF
-
-register :: String -> String -> Maybe String -> ReaderT Handle IO ()
-register n u p = send (irc_user u "Monad bot") >>
-                 send (irc_nick n) >>
-                 maybe (return ()) (send . irc_pass) p
-
 
 listen :: ReaderT Handle IO IrcConnection
 listen = reader (flip (,)) `ap` makeConn >>= \(ic, h) ->
