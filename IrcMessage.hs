@@ -27,10 +27,10 @@ type Text = T.Text
 data Prefix = Server { name :: Text } | User { nick :: Text, real :: Text, host :: Text } deriving (Eq)
 
 instance Show Prefix where
-    showsPrec x (Server name)         = showChar ':' . showsPrec x (T.unpack name)
-    showsPrec x (User nick real host) = showChar ':' . showsPrec x (T.unpack nick) .
-                                        showChar '!' . showsPrec x (T.unpack real) .
-                                        showChar '@' . showsPrec x (T.unpack host)
+    showsPrec x (Server name)         = showString (T.unpack name)
+    showsPrec x (User nick real host) = showString (T.unpack nick) . showChar '!' . 
+                                        showString (T.unpack real) .  showChar '@' . 
+                                        showString (T.unpack host)
 
 instance Read Prefix where
     readsPrec x pfx = case span (/='@') pfx of
@@ -42,12 +42,15 @@ instance Read Prefix where
                           in
                             return (User (T.pack nick) (T.pack real) (T.pack host), "")
 
-data RPL = Welcome deriving (Eq)
+data Code = RPL_Welcome
+          | ERR_NicknameInUse
+          deriving (Eq)
 
-instance Show RPL where
-    showsPrec x Welcome = showString "001"
+instance Show Code where
+    showsPrec x RPL_Welcome         = showString "001"
+    showsPrec x ERR_NicknameInUse   = showString "433"
 
-data Command = Numeric RPL | Register | Nick | Pass | Ping | Pong | Umode2 | Join | Invite | Privmsg | Notice | Undefined String deriving (Eq)
+data Command = Numeric Code | Register | Nick | Pass | Ping | Pong | Umode2 | Join | Invite | Privmsg | Notice | Undefined String deriving (Eq)
 
 instance Show Command where
     showsPrec x (Numeric rpl) = showsPrec x rpl
@@ -61,10 +64,11 @@ instance Show Command where
     showsPrec x Invite        = showString "INVITE"
     showsPrec x Privmsg       = showString "PRIVMSG"
     showsPrec x Notice        = showString "NOTICE"
-    showsPrec x (Undefined t) = showsPrec x t
+    showsPrec x (Undefined t) = showString t
 
 instance Read Command where
-    readsPrec x "001"     = return (Numeric Welcome, "")
+    readsPrec x "001"     = return (Numeric RPL_Welcome, "")
+    readsPrec x "433"     = return (Numeric ERR_NicknameInUse, "")
     readsPrec x "USER"    = return (Register, "")
     readsPrec x "NICK"    = return (Nick, "")
     readsPrec x "PASS"    = return (Pass, "")
@@ -82,13 +86,13 @@ data Params = Short { param :: Text, next :: Params }
             | End deriving (Eq)
 
 instance Show Params where
-    showsPrec x (Short param next)  = showsPrec x param .
+    showsPrec x (Short param next)  = (showString $ T.unpack param) .
                                       case next of
                                         End ->
                                           id
                                         param ->
                                           showChar ' ' . showsPrec x next
-    showsPrec x (Long param)        = showChar ':' . showsPrec x param
+    showsPrec x (Long param)        = showChar ':' . (showString $ T.unpack param)
     showsPrec x (End)               = id
 
 instance Read Params where
@@ -158,7 +162,7 @@ irc_pong code = Message Nothing Pong ( Long (T.pack code) )
 
 parseLine :: Message -> Writer [Message] ()
 parseLine msg = case msg of
-                  Message _ (Numeric Welcome) _ ->
+                  Message _ (Numeric RPL_Welcome) _ ->
                     tell [irc_umode2 "+B"] >>
                     mapM_ (tell . pure . irc_join) autoJoin
                   Message Nothing Ping (Long code) ->

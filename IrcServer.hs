@@ -62,8 +62,7 @@ listen = reader (flip (,)) `ap` makeConn >>= \(ic, h) ->
             return ic
         where
             readOnto :: Chan Message -> String -> IO ()
-            readOnto inp st = putStrLn st >>
-                              writeChan inp (read st)
+            readOnto inp st = writeChan inp (read st)
             writeOnto :: Handle -> Chan Message -> IO ()
             writeOnto h out = readChan out >>=
                               write h

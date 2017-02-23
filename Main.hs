@@ -16,7 +16,7 @@ import System.IO (IOMode(..), BufferMode(..), withFile)
 import Control.Applicative ((<$>), (<*>), pure)
 
 mako :: IO ()
-mako = Irc.startNetWorker (Irc.IrcServer "irc.sublumin.al" 6667 False) >>=
+mako = Irc.startNetWorker (Irc.IrcServer "irc.freenode.net" 6667 False) >>=
        Irc.startHandler
 
 main :: IO ()

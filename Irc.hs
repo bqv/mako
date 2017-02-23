@@ -9,6 +9,7 @@ import IrcServer (IrcServer(..), IrcConnection(..), connect, listen)
 import IrcMessage
 import qualified Logging as Log
 
+import qualified Data.Text as T (Text(..), pack, unpack)
 import Data.Char (chr)
 
 import Control.Concurrent.Chan (writeChan, readChan, getChanContents)
@@ -39,20 +40,54 @@ instance Functor IrcF where
     fmap f (Log s n)        = Log s (f n)
     fmap f Stop             = Stop
 
-send :: Message -> Free IrcF ()
-send message = liftF $ Send message ()
+class MonadIrcF f where
+    sendF :: Message -> Free f ()
+    receiveF :: Free f Message
+    isConnectedF :: Free f Bool
+    logF :: Log.Entry -> Free f ()
+    stopF :: Free f ()
 
-receive :: Free IrcF Message
-receive = liftF $ Receive id
+instance MonadIrcF IrcF where
+    sendF message = liftF $ Send message ()
+    receiveF = liftF $ Receive id
+    isConnectedF = liftF $ IsConnected id
+    logF entry = liftF $ Log entry ()
+    stopF = liftF $ Stop
 
-isConnected :: Free IrcF Bool
-isConnected = liftF $ IsConnected id
+instance MonadIrcF f => MonadIrc (Free f) where
+    send = sendF
+    receive = receiveF
+    isConnected = isConnectedF
+    log = logF
+    stop = stopF
 
-log :: Log.Entry -> Free IrcF ()
-log entry = liftF $ Log entry ()
+class MonadIrc m where
+    send :: Message -> m ()
+    receive :: m Message
+    isConnected :: m Bool
+    log :: Log.Entry -> m ()
+    stop :: m ()
 
-stop :: Free IrcF ()
-stop = liftF $ Stop
+instance (Monad m, MonadIrc m) => MonadIrc (StateT s m) where
+    send = lift . send
+    receive = lift receive
+    isConnected = lift isConnected
+    log = lift . log
+    stop = lift stop
+
+instance (Monad m, MonadIrc m) => MonadIrc (ReaderT r m) where
+    send = lift . send
+    receive = lift receive
+    isConnected = lift isConnected
+    log = lift . log
+    stop = lift stop
+
+instance (Monad m, Monoid w, MonadIrc m) => MonadIrc (WriterT w m) where
+    send = lift . send
+    receive = lift receive
+    isConnected = lift isConnected
+    log = lift . log
+    stop = lift stop
 
 runHandler :: Free IrcF a -> ReaderT IrcConnection IO ()
 runHandler (Pure a)                  = return ()
@@ -70,41 +105,56 @@ runHandler (Free (Log s n))          = liftIO (Log.write s) >>
 runHandler (Free (Stop))             = return ()
 
 register :: String -> String -> Maybe String -> StateT Data (Free IrcF) ()
-register n u p = ifM (gets registered) (lift tryRegister >> expectWelcome) (return ())
+register n u p = ifM (gets registered) (return ()) (tryRegister >> expectWelcome)
         where
-            tryRegister :: Free IrcF ()
+            tryRegister :: StateT Data (Free IrcF) ()
             tryRegister = send (irc_user u "Monad bot") >>
                           send (irc_nick n) >>
                           maybe (return ()) (send . irc_pass) p
             expectWelcome :: StateT Data (Free IrcF) ()
-            expectWelcome = lift receive >>=
+            expectWelcome = receive >>=
                             isWelcome >>=
                             setRegistered >>
-                            register n u p
-            isWelcome :: Monad m => Message -> m Bool
-            isWelcome = return . (== Numeric Welcome) . command
+                            ifM isConnected (register n u p) (return ())
+            isWelcome :: Message -> StateT Data (Free IrcF) Bool
+            isWelcome m = if command m == Numeric RPL_Welcome
+                          then return True
+                          else if command m == Numeric ERR_NicknameInUse
+                               then (send . irc_nick $ n++"_") >> return False
+                               else if command m == Ping
+                                    then runReaderT (execWriterT handlePing) m >> return False
+                                    else return False
             setRegistered :: Monad m => Bool -> StateT Data m ()
             setRegistered val = modify (\d -> d { registered = val })
 
 handler :: StateT Data (Free IrcF) ()
-handler = lift receive >>=
+handler = receive >>=
           runReaderT handleMessage >>
-          ifM (lift isConnected) handler (return ())
+          ifM isConnected handler (return ())
 
 handleMessage :: ReaderT Message (StateT Data (Free IrcF)) ()
 handleMessage = asks command >>=
                 execWriterT . dispatch >>=
-                lift . lift . mapM_ log
+                mapM_ log
         where
             dispatch :: Command -> WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
+            dispatch Ping       = handlePing
             dispatch Privmsg    = handlePrivmsg
+            dispatch Notice     = handleNotice
             dispatch _          = handleOther
 
+handlePing :: WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
+handlePing = asks params >>= send . irc_pong . T.unpack . param
+
 handlePrivmsg :: WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
-handlePrivmsg = lift ask >>= \msg -> tell [Log.info $ show msg]
+handlePrivmsg = ask >>= \msg -> tell [Log.info $ show msg]
+
+handleNotice :: WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
+handleNotice = ask >>= \msg -> tell [Log.info $ show msg] >>
+               (send $ irc_join "#botters")
 
 handleOther :: WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
-handleOther = lift ask >>= \msg -> tell [Log.debug $ show msg]
+handleOther = ask >>= \msg -> tell [Log.debug $ " =<< "++(show msg)]
 
 startHandler :: IrcConnection -> IO ()
 startHandler ic = runReaderT (runHandler theHandler) ic
@@ -116,7 +166,7 @@ startHandler ic = runReaderT (runHandler theHandler) ic
 
 startNetWorker :: IrcServer -> IO IrcConnection
 startNetWorker is = connect (IrcServer.host is) (IrcServer.port is) >>=
-                 runReaderT listen
+                    runReaderT listen
 
 colour :: Int -> String -> String
 colour i s
