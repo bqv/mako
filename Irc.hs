@@ -23,6 +23,8 @@ import Control.Monad.Trans (lift)
 
 import Control.Conditional (if', ifM)
 
+data Data = Data { registered :: Bool }
+
 data IrcF next
     = Send Message next
     | Receive (Message -> next)
@@ -67,12 +69,6 @@ runHandler (Free (Log s n))          = liftIO (Log.write s) >>
                                        runHandler n
 runHandler (Free (Stop))             = return ()
 
-startWorker :: IrcServer -> IO IrcConnection
-startWorker is = connect (IrcServer.host is) (IrcServer.port is) >>=
-                 runReaderT listen
-
-data Data = Data { registered :: Bool }
-
 register :: String -> String -> Maybe String -> StateT Data (Free IrcF) ()
 register n u p = ifM (gets registered) (lift tryRegister >> expectWelcome) (return ())
         where
@@ -82,10 +78,12 @@ register n u p = ifM (gets registered) (lift tryRegister >> expectWelcome) (retu
                           maybe (return ()) (send . irc_pass) p
             expectWelcome :: StateT Data (Free IrcF) ()
             expectWelcome = lift receive >>=
-                            return . (== Numeric Welcome) . command >>=
+                            isWelcome >>=
                             setRegistered >>
                             register n u p
-            setRegistered :: Bool -> StateT Data (Free IrcF) ()
+            isWelcome :: Monad m => Message -> m Bool
+            isWelcome = return . (== Numeric Welcome) . command
+            setRegistered :: Monad m => Bool -> StateT Data m ()
             setRegistered val = modify (\d -> d { registered = val })
 
 handler :: StateT Data (Free IrcF) ()
@@ -115,6 +113,10 @@ startHandler ic = runReaderT (runHandler theHandler) ic
             theHandler = execStateT (register "bot" "monadbot" Nothing >> handler) theData >> return ()
             theData :: Data
             theData = Data { registered = False }
+
+startWorker :: IrcServer -> IO IrcConnection
+startWorker is = connect (IrcServer.host is) (IrcServer.port is) >>=
+                 runReaderT listen
 
 colour :: Int -> String -> String
 colour i s

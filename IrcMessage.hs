@@ -123,12 +123,15 @@ instance Show Message where
 
 instance Read Message where
     readsPrec x (':':line)  = let 
-                                (pfx, ' ':msg) = break (==' ') line
-                                (cmd, ' ':params) = break (==' ') msg
+                                (pfx, msg') = break (==' ') line
+                                msg = dropWhile (==' ') msg'
+                                (cmd, params') = break (==' ') msg
+                                params = dropWhile (==' ') params'
                               in
                                 return (Message (Just $ read pfx) (read cmd) (read params), "")
     readsPrec x msg         = let
-                                (cmd, ' ':params) = break (==' ') msg
+                                (cmd, params') = break (==' ') msg
+                                params = dropWhile (==' ') params'
                               in
                                 return (Message Nothing (read cmd) (read params), "")
 
