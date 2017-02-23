@@ -28,6 +28,8 @@ import Control.Exception (IOException, handle)
 import Control.Monad (forever, ap)
 import Control.Monad.Reader (ReaderT(..), runReaderT, ask, reader, liftIO)
 
+import Control.Conditional (if', ifM)
+
 data IrcServer = IrcServer {
                     host :: String,
                     port :: Int,
@@ -55,16 +57,16 @@ connect server port = connectTo server portno >>=
 listen :: ReaderT Handle IO IrcConnection
 listen = reader (flip (,)) `ap` makeConn >>= \(ic, h) ->
             (loopWithState (connected ic) $ hGetLine h >>=
-                                            readOnto (readQ ic) >>
-                                            writeOnto h (sendQ ic)) >>
+                                            readOnto (readQ ic)) >>
+            (loopWhile (connected ic) $ writeOnto h (sendQ ic)) >>
             return ic
         where
             readOnto :: Chan Message -> String -> IO ()
             readOnto inp st = putStrLn st >>
                               writeChan inp (read st)
             writeOnto :: Handle -> Chan Message -> IO ()
-            writeOnto h out = getChanContents out >>=
-                              mapM_ (write h)
+            writeOnto h out = readChan out >>=
+                              write h
             makeConn :: ReaderT Handle IO IrcConnection
             makeConn = liftIO newChan >>= \input ->
                        liftIO newChan >>= \output ->
@@ -72,6 +74,8 @@ listen = reader (flip (,)) `ap` makeConn >>= \(ic, h) ->
                            return (IrcConnection input output state)
             loopWithState :: TVar Bool -> IO a -> ReaderT Handle IO ThreadId
             loopWithState tv io = liftIO $ forkFinally (forever io) (const . atomically $ writeTVar tv False) 
+            loopWhile :: TVar Bool -> IO () -> ReaderT Handle IO ThreadId
+            loopWhile tv io = liftIO . forkIO . forever $ ifM (atomically $ readTVar tv) io (return ())
 
 send :: Message -> ReaderT Handle IO ()
 send msg = ReaderT (flip write msg)

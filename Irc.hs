@@ -114,8 +114,8 @@ startHandler ic = runReaderT (runHandler theHandler) ic
             theData :: Data
             theData = Data { registered = False }
 
-startWorker :: IrcServer -> IO IrcConnection
-startWorker is = connect (IrcServer.host is) (IrcServer.port is) >>=
+startNetWorker :: IrcServer -> IO IrcConnection
+startNetWorker is = connect (IrcServer.host is) (IrcServer.port is) >>=
                  runReaderT listen
 
 colour :: Int -> String -> String
