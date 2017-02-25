@@ -6,7 +6,6 @@ import Prelude hiding ()
 
 import qualified Config (serverHost, serverPort, autoJoin, botNick, markovOrder, opList)
 import qualified Irc (IrcServer(..), startNetWorker, startHandler)
-import qualified Markov (imitate, catalog)
 
 import Control.Monad.Free (Free(..), liftF)
 
