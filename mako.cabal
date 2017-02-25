@@ -10,5 +10,5 @@ executable mako
     ghc-options:    -O2 -threaded -fprof-auto "-with-rtsopts=-xc"
     build-depends:  base, containers, network, random,
                     mmorph, lens, bytestring, text,
-                    directory, mtl, hashable, hashmap,
-                    comonad, free, stm, cond
+                    directory, mtl, hashable, unordered-containers,
+                    comonad, free, stm, cond, bifunctors
