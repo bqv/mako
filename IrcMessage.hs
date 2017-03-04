@@ -157,6 +157,9 @@ irc_umode2 mode = Message Nothing Umode2 ( Short (T.pack mode) End )
 irc_join :: String -> Message
 irc_join chan = Message Nothing Join ( Short (T.pack chan) End )
 
+irc_privmsg :: Text -> Text -> Message
+irc_privmsg chan msg = Message Nothing Privmsg ( Short chan ( Long msg ) )
+
 irc_pong :: String -> Message
 irc_pong code = Message Nothing Pong ( Long (T.pack code) )
 

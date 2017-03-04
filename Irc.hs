@@ -127,27 +127,26 @@ register n u p = ifM (gets registered) (return ()) (tryRegister >> expectWelcome
             setRegistered :: Monad m => Bool -> StateT Data m ()
             setRegistered val = modify (\d -> d { registered = val })
 
-handler :: StateT Data (Free IrcF) ()
-handler = receive >>=
-          runReaderT handleMessage >>
-          ifM isConnected handler (return ())
+handler :: Handler () -> StateT Data (Free IrcF) ()
+handler h = receive >>=
+            runReaderT (handleMessage h) >>
+            ifM isConnected (handler h) (return ())
 
-handleMessage :: ReaderT Message (StateT Data (Free IrcF)) ()
-handleMessage = asks command >>=
-                execWriterT . dispatch >>=
-                mapM_ log
+handleMessage :: Handler () -> ReaderT Message (StateT Data (Free IrcF)) ()
+handleMessage h = asks command >>=
+                  execWriterT . dispatch >>=
+                  mapM_ log
         where
             dispatch :: Command -> WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
             dispatch Ping       = handlePing
-            dispatch Privmsg    = handlePrivmsg
+            dispatch Privmsg    = h
             dispatch Notice     = handleNotice
             dispatch _          = handleOther
 
+type Handler = WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF)))
+
 handlePing :: WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
 handlePing = asks params >>= send . irc_pong . T.unpack . param
-
-handlePrivmsg :: WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
-handlePrivmsg = ask >>= \msg -> tell [Log.info $ show msg]
 
 handleNotice :: WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
 handleNotice = ask >>= \msg -> tell [Log.info $ show msg] >>
@@ -156,11 +155,11 @@ handleNotice = ask >>= \msg -> tell [Log.info $ show msg] >>
 handleOther :: WriterT [Log.Entry] (ReaderT Message (StateT Data (Free IrcF))) ()
 handleOther = ask >>= \msg -> tell [Log.debug $ " =<< "++(show msg)]
 
-startHandler :: IrcConnection -> IO ()
-startHandler ic = runReaderT (runHandler theHandler) ic
+startHandler :: Handler () -> IrcConnection -> IO ()
+startHandler h ic = runReaderT (runHandler theHandler) ic
         where
             theHandler :: Free IrcF ()
-            theHandler = execStateT (register "bot" "monadbot" Nothing >> handler) theData >> return ()
+            theHandler = execStateT (register "bot" "monadbot" Nothing >> handler h) theData >> return ()
             theData :: Data
             theData = Data { registered = False }
 
