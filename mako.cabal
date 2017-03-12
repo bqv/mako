@@ -8,7 +8,7 @@ cabal-version:      >=1.2
 executable mako
     main-is:        Main.hs
     ghc-options:    -O2 -threaded -fprof-auto "-with-rtsopts=-xc"
-    build-depends:  base, containers, network, random,
-                    mmorph, lens, bytestring, text,
+    build-depends:  base, containers, network, random, strict,
+                    mmorph, lens, bytestring, text, time,
                     directory, mtl, hashable, unordered-containers,
                     comonad, free, stm, cond, bifunctors

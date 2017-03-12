@@ -139,29 +139,29 @@ instance Read Message where
                               in
                                 return (Message Nothing (read cmd) (read params), "")
 
-irc_user :: String -> String -> Message
-irc_user ident realname = Message Nothing Register (Short (T.pack ident)
+irc_user :: (Writeable a, Writeable b) => a -> b -> Message
+irc_user ident realname = Message Nothing Register (Short (text ident)
                                                   $ Short (T.singleton '-')
                                                   $ Short (T.singleton '*')
-                                                  $ Long (T.pack realname))
+                                                  $ Long (text realname))
 
-irc_nick :: String -> Message
-irc_nick nick = Message Nothing Nick ( Short (T.pack nick) End )
+irc_nick :: Writeable a => a -> Message
+irc_nick nick = Message Nothing Nick ( Short (text nick) End )
 
-irc_pass :: String -> Message
-irc_pass pass = Message Nothing Pass ( Short (T.pack pass) End )
+irc_pass :: Writeable a => a -> Message
+irc_pass pass = Message Nothing Pass ( Short (text pass) End )
 
-irc_umode2 :: String -> Message
-irc_umode2 mode = Message Nothing Umode2 ( Short (T.pack mode) End )
+irc_umode2 :: Writeable a => a -> Message
+irc_umode2 mode = Message Nothing Umode2 ( Short (text mode) End )
 
-irc_join :: String -> Message
-irc_join chan = Message Nothing Join ( Short (T.pack chan) End )
+irc_join :: Writeable a => a -> Message
+irc_join chan = Message Nothing Join ( Short (text chan) End )
 
-irc_privmsg :: Text -> Text -> Message
-irc_privmsg chan msg = Message Nothing Privmsg ( Short chan ( Long msg ) )
+irc_privmsg :: (Writeable a, Writeable b) => a -> b -> Message
+irc_privmsg chan msg = Message Nothing Privmsg ( Short (text chan) ( Long (text msg) ) )
 
-irc_pong :: String -> Message
-irc_pong code = Message Nothing Pong ( Long (T.pack code) )
+irc_pong :: Writeable a => a -> Message
+irc_pong code = Message Nothing Pong ( Long (text code) )
 
 parseLine :: Message -> Writer [Message] ()
 parseLine msg = case msg of
@@ -190,24 +190,21 @@ handleMsg pfx dest msg = let
                              Nothing ->
                                return ()
 
--- Begin Filthy Hack
 class WriteableS a where
-    writeS :: Handle -> [a] -> IO ()
+    textS :: [a] -> Text
 
 instance WriteableS Char where 
-    writeS h msg = write h $ T.pack msg
+    textS msg = T.pack msg
 
 instance WriteableS a => Writeable [a] where
-    write = writeS
--- End Filthy Hack
+    text = textS
 
 class Writeable a where
-    write :: Handle -> a -> IO ()
+    text :: a -> Text
 
 instance Writeable Message where
-    write h msg = write h $ show msg
+    text msg = T.pack $ show msg
 
 instance Writeable T.Text where
-    write h msg = T.hPutStrLn h msg >>
-                  T.putStrLn msg
+    text msg = msg
 

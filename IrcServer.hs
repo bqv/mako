@@ -14,7 +14,7 @@ import IrcMessage
 
 import Network (connectTo, PortID(PortNumber))
 
-import System.IO (Handle, hSetBuffering, BufferMode(..), hGetLine,
+import System.IO (Handle, hSetBuffering, BufferMode(..), hGetLine, hPutStrLn,
                   mkTextEncoding, hSetEncoding, stdout, hSetNewlineMode,
                   NewlineMode(..), Newline(..))
 
@@ -37,6 +37,7 @@ data IrcServer = IrcServer {
                  }
 
 data IrcConnection = IrcConnection {
+                        socket :: Handle,
                         readQ :: Chan Message,
                         sendQ :: Chan Message,
                         connected :: TVar Bool
@@ -56,26 +57,27 @@ connect server port = connectTo server portno >>=
 
 listen :: ReaderT Handle IO IrcConnection
 listen = reader (flip (,)) `ap` makeConn >>= \(ic, h) ->
-            (loopWithState (connected ic) $ hGetLine h >>=
-                                            readOnto (readQ ic)) >>
+            (loopWithState (connected ic) $ readOnto h (readQ ic)) >>
             (loopWhile (connected ic) $ writeOnto h (sendQ ic)) >>
             return ic
         where
-            readOnto :: Chan Message -> String -> IO ()
-            readOnto inp st = writeChan inp (read st)
+            readOnto :: Handle -> Chan Message -> IO ()
+            readOnto h inp = hGetLine h >>=
+                             writeChan inp . read
             writeOnto :: Handle -> Chan Message -> IO ()
             writeOnto h out = readChan out >>=
-                              write h
+                              hPutStrLn h . show
             makeConn :: ReaderT Handle IO IrcConnection
             makeConn = liftIO newChan >>= \input ->
                        liftIO newChan >>= \output ->
                        liftIO (atomically $ newTVar True) >>= \state ->
-                           return (IrcConnection input output state)
+                       ask >>= \sock ->
+                         return (IrcConnection sock input output state)
             loopWithState :: TVar Bool -> IO a -> ReaderT Handle IO ThreadId
             loopWithState tv io = liftIO $ forkFinally (forever io) (const . atomically $ writeTVar tv False) 
             loopWhile :: TVar Bool -> IO () -> ReaderT Handle IO ThreadId
             loopWhile tv io = liftIO . forkIO . forever $ ifM (atomically $ readTVar tv) io (return ())
 
 send :: Message -> ReaderT Handle IO ()
-send msg = ReaderT (flip write msg)
+send msg = ReaderT (flip hPutStrLn . show $ msg)
 
